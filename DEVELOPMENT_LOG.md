@@ -11,7 +11,7 @@ The initial implementation had several discrepancies with the standard physics o
 ### 2. Implementation Changes
 
 #### Gate Logic (`src/pypoli/gates.py`)
-- **Generated Correct Tables**: Created `scripts/tools_gen_tables.py` to verify and generate correct Pauli mappings for CNOT and CZ gates.
+- **Generated Correct Tables**: Created `tools_gen_tables.py` to verify and generate correct Pauli mappings for CNOT and CZ gates.
 - **Updated `clifford_map`**: Replaced the incorrect lookup tables with the verified ones.
 - **Fixed Rotation Logic**: 
   - Corrected the formula for rotation gates to $P \to P \cos\theta - i \sin\theta [G, P]$ (where $G$ is the generator).
@@ -24,7 +24,7 @@ The initial implementation had several discrepancies with the standard physics o
   - Added `jit_expectation_value` for JAX compatibility.
 
 ### 3. Verification
-- **Demo Script**: Created `scripts/demo.py` (and updated `pypoli_demo.ipynb`) to test the full pipeline.
+- **Demo Script**: Created `demo.py` (and updated `pypoli_demo.ipynb`) to test the full pipeline.
 - **Results**:
   - Validated that $\langle 0|Z|0\rangle = 1$ and $\langle 0|X|0\rangle = 0$.
   - Validated correct gradient descent training for state preparation.
