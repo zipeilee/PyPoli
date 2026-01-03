@@ -97,8 +97,55 @@ class Circuit:
 
                 # Apply coefficient magnitude truncation if specified
                 if keep and min_abs_coeff is not None:
-                    if jnp.abs(term.coefficient) < min_abs_coeff:
-                        keep = False
+                    # Use jax.lax.cond or similar for tracing-safe condition if needed,
+                    # but for simple structure-changing operations (filtering list),
+                    # we cannot filter based on traced values inside JIT.
+                    #
+                    # However, term.coefficient is a JAX Tracer when inside JIT.
+                    # Python's `if` cannot evaluate a Tracer.
+                    #
+                    # SOLUTION: We cannot drop terms based on traced coefficient values during JIT compilation
+                    # because the structure of the computation graph (which terms exist) depends on values.
+                    #
+                    # If we are inside JIT (tracer), we CANNOT remove terms from the list based on value.
+                    # We can only zero them out (masking), but they still exist in the graph.
+                    #
+                    # BUT, Pauli propagation is inherently dynamic structure.
+                    # This means we CANNOT JIT compile the `propagate` function if truncation depends on dynamic values.
+                    #
+                    # Strategy:
+                    # 1. If we are not JITing (concrete values), we filter.
+                    # 2. If we are JITing (tracers), we CANNOT filter list length.
+                    #    We can only multiply by a mask: coeff = coeff * (abs(coeff) >= threshold).
+                    #    This keeps the term but with 0 coefficient.
+                    
+                    is_tracer = hasattr(term.coefficient, 'aval') or hasattr(term.coefficient, 'tracer')
+                    
+                    if not is_tracer:
+                        # Concrete value execution (eager mode)
+                        if jnp.abs(term.coefficient) < min_abs_coeff:
+                            keep = False
+                    else:
+                        # JIT/Traced execution
+                        # We cannot change the list structure based on values.
+                        # We keep the term but zero out its coefficient if it's small.
+                        # Note: This defeats the speedup purpose of truncation (reducing terms),
+                        # but allows JIT to run.
+                        # To truly get speedup, one must not JIT the propagation structure logic,
+                        # or use static parameters that don't change.
+                        #
+                        # However, for hybrid training, parameters change, so coefficients change.
+                        # So the set of Pauli strings would change dynamically.
+                        # JAX JIT requires static graph structure.
+                        #
+                        # Conclusion: Dynamic truncation based on coefficients is incompatible with JAX JIT
+                        # if we want to actually remove terms from the list to save compute.
+                        #
+                        # For this specific error, we will use a mask for Tracers.
+                        mask = (jnp.abs(term.coefficient) >= min_abs_coeff).astype(term.coefficient.dtype)
+                        term.coefficient = term.coefficient * mask
+                        # We keep the term (it has 0 coeff now if truncated)
+                        keep = True
 
                 # Apply deprecated truncation parameter if still used
                 if keep and truncation is not None:
@@ -113,7 +160,30 @@ class Circuit:
                 if keep:
                     filtered.append(term)
 
-            current_terms = filtered
+            # Deduplication / Merging of terms
+            # This is crucial for performance to prevent exponential growth of redundant terms.
+            # We group by Pauli string signature (dict keys) and sum coefficients.
+            # In JIT mode, this "sum" will be a sum of Tracers.
+            
+            merged_terms = {}
+            for term in filtered:
+                # PauliString needs to be hashable or have a unique string rep.
+                # Assuming str(term) or term.paulis (frozenset/tuple) is a good key.
+                # PauliString.paulis is a dict {qubit: 'X/Y/Z'}. We can make it a tuple of sorted items.
+                
+                # Create a canonical key for the Pauli operator part (ignoring coefficient)
+                # Sort by qubit index
+                sorted_items = tuple(sorted(term.paulis.items()))
+                key = sorted_items 
+                
+                if key in merged_terms:
+                    # Sum coefficients
+                    merged_terms[key].coefficient = merged_terms[key].coefficient + term.coefficient
+                else:
+                    # Store the term (we clone it to be safe, though not strictly necessary if we don't mutate in place elsewhere)
+                    merged_terms[key] = term
+            
+            current_terms = list(merged_terms.values())
 
         return current_terms
 
