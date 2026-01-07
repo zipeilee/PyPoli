@@ -1,0 +1,6 @@
+## Environment & Tools
+- **Shell**: Use `fish` shell syntax for all terminal commands.
+- **Python Manager**: ALWAYS use `uv` for package management.
+- **Install**: `uv add <package>` (or `uv add --dev <package>`)
+- **Run**: `uv run python script.py`
+- **Prohibited**: Do NOT use `pip install` or `python -m venv`.

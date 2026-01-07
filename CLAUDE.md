@@ -1,5 +1,12 @@
 # PyPoli - JAX-only Pauli Propagation Library
 
+## Environment & Tools
+- **Shell**: Use `fish` shell syntax for all terminal commands.
+- **Python Manager**: ALWAYS use `uv` for package management.
+- **Install**: `uv add <package>` (or `uv add --dev <package>`)
+- **Run**: `uv run python script.py`
+- **Prohibited**: Do NOT use `pip install` or `python -m venv`.
+
 PyPoli是一个纯JAX实现的Pauli传播库，基于PauliPropagation.jl的设计原则，专注于高效的可观测值中心Pauli传播，支持自动微分和硬件高效Ansatz。
 
 ## 核心设计原则

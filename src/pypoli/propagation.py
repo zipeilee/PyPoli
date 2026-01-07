@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from typing import List, Any
 
 
-def propagate(circuit, pauli_observable, truncation=None, max_weight=None, min_abs_coeff=None) -> List:
+def propagate(circuit, pauli_observable, truncation=None, max_weight=None, min_abs_coeff=None, damping=0.0) -> List:
     """
     Propagate an observable (PauliString or PauliSum) through a circuit in the Heisenberg picture.
 
@@ -26,14 +26,15 @@ def propagate(circuit, pauli_observable, truncation=None, max_weight=None, min_a
                     below threshold are removed.
         max_weight: Maximum Pauli weight (number of non-identity Paulis) to keep
         min_abs_coeff: Minimum absolute coefficient magnitude to keep
+        damping: Damping factor for soft truncation. Condition: |coeff| * 10^(-damping * weight) >= min_abs_coeff
 
     Returns:
         List[PauliString]: Propagated and possibly truncated Pauli strings
     """
-    return circuit.propagate(pauli_observable, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff)
+    return circuit.propagate(pauli_observable, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff, damping=damping)
 
 
-def expectation_value(circuit_or_propagated, observable=None, truncation=None, max_weight=None, min_abs_coeff=None) -> Any:
+def expectation_value(circuit_or_propagated, observable=None, truncation=None, max_weight=None, min_abs_coeff=None, damping=0.0) -> Any:
     """
     Calculate the expectation value of an observable for the vacuum state |000...0⟩
 
@@ -51,6 +52,7 @@ def expectation_value(circuit_or_propagated, observable=None, truncation=None, m
                     None, float threshold, or callable for truncation (only applied if circuit is passed)
         max_weight: Maximum Pauli weight (number of non-identity Paulis) to keep during propagation
         min_abs_coeff: Minimum absolute coefficient magnitude to keep during propagation
+        damping: Damping factor for soft truncation. Condition: |coeff| * 10^(-damping * weight) >= min_abs_coeff
 
     Returns:
         float: Expectation value ⟨0| U† O U |0⟩
@@ -62,7 +64,7 @@ def expectation_value(circuit_or_propagated, observable=None, truncation=None, m
     if isinstance(circuit_or_propagated, Circuit):
         if observable is None:
             raise ValueError("observable must be provided when calling expectation_value with a Circuit")
-        propagated = circuit_or_propagated.propagate(observable, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff)
+        propagated = circuit_or_propagated.propagate(observable, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff, damping=damping)
     else:
         propagated = circuit_or_propagated
 
@@ -84,7 +86,7 @@ def expectation_value(circuit_or_propagated, observable=None, truncation=None, m
     return jnp.real(expectation)
 
 
-def batch_expectation_value(circuit, observables, truncation=None, max_weight=None, min_abs_coeff=None) -> List:
+def batch_expectation_value(circuit, observables, truncation=None, max_weight=None, min_abs_coeff=None, damping=0.0) -> List:
     """
     Calculate expectation values for multiple observables in batch.
 
@@ -95,11 +97,12 @@ def batch_expectation_value(circuit, observables, truncation=None, max_weight=No
                     None, float threshold, or callable for truncation
         max_weight: Maximum Pauli weight (number of non-identity Paulis) to keep during propagation
         min_abs_coeff: Minimum absolute coefficient magnitude to keep during propagation
+        damping: Damping factor for soft truncation. Condition: |coeff| * 10^(-damping * weight) >= min_abs_coeff
 
     Returns:
         List[float]: Expectation values for each observable
     """
-    return [expectation_value(circuit, obs, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff) for obs in observables]
+    return [expectation_value(circuit, obs, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff, damping=damping) for obs in observables]
 
 # JIT compilation of expectation_value
 # Note: This requires static arguments for non-Pytree objects (Circuit, PauliString)

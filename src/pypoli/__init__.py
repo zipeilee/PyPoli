@@ -1,3 +1,4 @@
+
 """
 PyPoli - JAX-only Pauli Propagation library for quantum circuits
 
@@ -22,6 +23,7 @@ from .propagation import (
     propagate, expectation_value,
     jit_expectation_value, batch_expectation_value
 )
+from .jit_propagation import make_jit_loss_fn, JITPropagator
 from .ansatz import (
     VariationalAnsatz,
     HardwareEfficient,
@@ -42,6 +44,7 @@ __all__ = [
     # Propagation and expectation
     'propagate', 'expectation_value',
     'jit_expectation_value', 'batch_expectation_value',
+    'make_jit_loss_fn', 'JITPropagator',
 
     # Ansatz implementations
     'VariationalAnsatz',

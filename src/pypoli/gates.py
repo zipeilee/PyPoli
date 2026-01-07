@@ -170,6 +170,14 @@ cz_list[0x0F] = (0x0F, 1)
 clifford_map['CZ'] = cz_list
 
 
+class Parameter:
+    """A symbolic parameter for parameterized gates."""
+    def __init__(self, name: str):
+        self.name = name
+    
+    def __repr__(self):
+        return f"Parameter('{self.name}')"
+
 class Gate:
     """
     Base class for all quantum gates.
@@ -183,8 +191,29 @@ class Gate:
             qubits: Tuple of qubit indices this gate acts on
         """
         self.qubits = qubits
+        # Subclasses with parameters should populate this list with their parameter names
+        # in the order they appear in the constructor args.
+        # e.g. RX(q, theta) -> self.params = [theta]
+        # But wait, theta might be a float or a Parameter object.
+        # We need to distinguish.
+        self.params = [] 
+
+    def bind_parameters(self, param_values: list) -> 'Gate':
+        """
+        Return a new gate with parameters bound to values.
+        Takes a list of values and consumes them in order.
+        Returns the new gate.
+        Note: The caller is responsible for slicing the correct values.
+        Actually, for simplicity, let's just pass the map?
+        No, user wants implicit binding.
+        
+        So we pass a list of values. But how does the gate know WHICH values?
+        The caller (Circuit.propagate) iterates over gates and parameters simultaneously.
+        """
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+
         """
         Action of this gate on a Pauli string.
 
@@ -332,8 +361,21 @@ class RX(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        
+        # Auto-convert string to Parameter
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta # Can be float, JAX array, or Parameter
         self.generator_mask = PauliString._pauli_to_bit['X']
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RX':
+        if isinstance(self.theta, Parameter):
+            # Consume one value
+            return RX(self.qubits[0], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
         pauli_bits = pauli_str.get_pauli_bit(self.qubits)
@@ -343,8 +385,15 @@ class RX(Gate):
 
         # For non-commuting cases (Y, Z)
         # P -> P cos(theta) - i sin(theta) (X P)
-        cos_val = jnp.cos(self.theta)
-        sin_val = jnp.sin(self.theta)
+        
+        # If theta is a Parameter, we cannot compute cos/sin yet.
+        # This method assumes bound parameters (concrete values or JAX tracers).
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+            
+        theta_val = jnp.asarray(self.theta, dtype=jnp.float64)
+        cos_val = jnp.cos(theta_val)
+        sin_val = jnp.sin(theta_val)
 
         if pauli_bits == PauliString._pauli_to_bit['Y']:
             # X Y = iZ. -i sin (iZ) = sin Z.
@@ -372,8 +421,20 @@ class RY(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        
+        # Auto-convert string to Parameter
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
         self.generator_mask = PauliString._pauli_to_bit['Y']
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RY':
+        if isinstance(self.theta, Parameter):
+            return RY(self.qubits[0], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
         pauli_bits = pauli_str.get_pauli_bit(self.qubits)
@@ -381,8 +442,12 @@ class RY(Gate):
         if pauli_bits == self.generator_mask or pauli_bits == 0:
             return [pauli_str]
 
-        cos_val = jnp.cos(self.theta)
-        sin_val = jnp.sin(self.theta)
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+            
+        theta_val = jnp.asarray(self.theta, dtype=jnp.float64)
+        cos_val = jnp.cos(theta_val)
+        sin_val = jnp.sin(theta_val)
 
         if pauli_bits == PauliString._pauli_to_bit['X']:
             # Y X = -iZ. -i sin (-iZ) = -sin Z
@@ -410,8 +475,20 @@ class RZ(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        
+        # Auto-convert string to Parameter
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
         self.generator_mask = PauliString._pauli_to_bit['Z']
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RZ':
+        if isinstance(self.theta, Parameter):
+            return RZ(self.qubits[0], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
         pauli_bits = pauli_str.get_pauli_bit(self.qubits)
@@ -419,8 +496,12 @@ class RZ(Gate):
         if pauli_bits == self.generator_mask or pauli_bits == 0:
             return [pauli_str]
 
-        cos_val = jnp.cos(self.theta)
-        sin_val = jnp.sin(self.theta)
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+            
+        theta_val = jnp.asarray(self.theta, dtype=jnp.float64)
+        cos_val = jnp.cos(theta_val)
+        sin_val = jnp.sin(theta_val)
 
         if pauli_bits == PauliString._pauli_to_bit['X']:
             # Z X = iY. -i sin (iY) = sin Y
@@ -449,9 +530,23 @@ class RXX(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RXX':
+        if isinstance(self.theta, Parameter):
+            return RXX(self.qubits[0], self.qubits[1], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+        # ... rest of implementation assumes bound theta ...
         q0, q1 = self.qubits
         p0 = pauli_str.paulis.get(q0, 'I')
         p1 = pauli_str.paulis.get(q1, 'I')
@@ -493,9 +588,23 @@ class RYY(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RYY':
+        if isinstance(self.theta, Parameter):
+            return RYY(self.qubits[0], self.qubits[1], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+            
         q0, q1 = self.qubits
         p0 = pauli_str.paulis.get(q0, 'I')
         p1 = pauli_str.paulis.get(q1, 'I')
@@ -528,9 +637,23 @@ class RZZ(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RZZ':
+        if isinstance(self.theta, Parameter):
+            return RZZ(self.qubits[0], self.qubits[1], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+            
         q0, q1 = self.qubits
         p0 = pauli_str.paulis.get(q0, 'I')
         p1 = pauli_str.paulis.get(q1, 'I')

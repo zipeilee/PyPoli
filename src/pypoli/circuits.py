@@ -11,14 +11,44 @@ class Circuit:
     Quantum circuit implementation with Pauli propagation support.
     """
 
-    def __init__(self, gates: List[Gate] = None):
+    def __init__(self, gates: List[Gate] = None, structure=None, params=None):
         """
         Initialize a quantum circuit.
 
         Args:
             gates: List of gates to add to the circuit initially
+            structure: Internal structure info (e.g. for repeated layers)
+            params: Bound parameters for the circuit (JAX array)
         """
         self.gates = gates if gates is not None else []
+        self.structure = structure # {'type': 'repeated_layer', 'layer_circuit': Circuit, 'depth': int}
+        self.params = params
+
+    @classmethod
+    def from_layer(cls, layer_circuit: 'Circuit', depth: int):
+        """
+        Create a Circuit from a repeated layer.
+        
+        Args:
+            layer_circuit: The circuit template for one layer (with Parameters)
+            depth: Number of repetitions
+        """
+        # We don't expand gates here. We store the structure.
+        return cls(gates=[], structure={'type': 'repeated_layer', 'layer_circuit': layer_circuit, 'depth': depth})
+
+    def bind(self, params) -> 'Circuit':
+        """
+        Bind parameters to the circuit.
+        
+        Args:
+            params: JAX array of parameters.
+            
+        Returns:
+            A new Circuit object with bound parameters.
+        """
+        # Return a shallow copy with new params
+        # We share gates/structure to save memory
+        return Circuit(gates=self.gates, structure=self.structure, params=params)
 
     def add_gate(self, gate: Gate):
         """
@@ -27,11 +57,14 @@ class Circuit:
         Args:
             gate: Gate to add to the circuit
         """
+        if self.structure:
+            raise ValueError("Cannot add gates to a structured Circuit (e.g. created via from_layer).")
         self.gates.append(gate)
 
-    def append(self, gate: Gate):
+
+    def add(self, gate: Gate):
         """
-        Alias for add_gate to support list-like append interface.
+        Alias for add_gate.
         """
         self.add_gate(gate)
 
@@ -45,37 +78,43 @@ class Circuit:
         for gate in gates:
             self.add_gate(gate)
 
-    def propagate(self, pauli_obj, truncation=None, max_weight=None, min_abs_coeff=None) -> List:
+    def propagate(self, pauli_obj, truncation=None, max_weight=None, min_abs_coeff=None, damping=0.0, params=None) -> List:
         """
-        Propagate a Pauli string or Pauli sum through the circuit with optional truncation after each gate.
-
-        This implements the Heisenberg picture propagation:
-        - Gates are applied in reverse order
-        - The action of each gate is its conjugate action
-
+        Propagate a Pauli string or Pauli sum through the circuit.
+        
         Args:
-            pauli_obj: PauliString or PauliSum to propagate (Heisenberg picture)
-            truncation: DEPRECATED: Use min_abs_coeff or max_weight instead.
-                        None, float threshold, or callable that takes a list of PauliString
-                        and returns a truncated list. If float, terms with abs(coefficient)
-                        below threshold are removed.
-            max_weight: Maximum Pauli weight (number of non-identity Paulis) to keep
-            min_abs_coeff: Minimum absolute coefficient magnitude to keep
-
-        Returns:
-            List[PauliString]: List of Pauli strings after propagation
+            pauli_obj: PauliString or PauliSum to propagate
+            max_weight: Maximum Pauli weight to keep
+            min_abs_coeff: Minimum absolute coefficient to keep
+            damping: Damping factor for soft truncation. 
+                     Condition: |coeff| * 10^(-damping * weight) >= min_abs_coeff
+            params: Optional parameters. If None, uses bound self.params.
+            
+        Note:
+            If the circuit is parameterized, parameters must be bound via .bind(params) before calling propagate.
         """
-        # Handle both PauliString and PauliSum
         from .core import PauliString, PauliSum
 
+        # Use bound parameters if not provided explicitly
+        if params is None:
+            params = self.params
+
+        # Standard Python propagation implementation (JIT-traceable but slow compile if large)
         if isinstance(pauli_obj, PauliSum):
             # Propagate each term in the sum
             propagated = []
             for term in pauli_obj.pauli_strings:
-                propagated.extend(self.propagate(term, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff))
+                propagated.extend(self.propagate(term, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff, damping=damping))
             return propagated
 
-        # Start with the input Pauli object
+        if isinstance(pauli_obj, list):
+            # Propagate each term in the list
+            propagated = []
+            for term in pauli_obj:
+                propagated.extend(self.propagate(term, truncation=truncation, max_weight=max_weight, min_abs_coeff=min_abs_coeff, damping=damping))
+            return propagated
+
+        # Base case: Single PauliString
         current_terms = [pauli_obj]
 
         # Apply gates in reverse order for Heisenberg picture (as in PauliPropagation.jl)
@@ -97,52 +136,27 @@ class Circuit:
 
                 # Apply coefficient magnitude truncation if specified
                 if keep and min_abs_coeff is not None:
-                    # Use jax.lax.cond or similar for tracing-safe condition if needed,
-                    # but for simple structure-changing operations (filtering list),
-                    # we cannot filter based on traced values inside JIT.
-                    #
-                    # However, term.coefficient is a JAX Tracer when inside JIT.
-                    # Python's `if` cannot evaluate a Tracer.
-                    #
-                    # SOLUTION: We cannot drop terms based on traced coefficient values during JIT compilation
-                    # because the structure of the computation graph (which terms exist) depends on values.
-                    #
-                    # If we are inside JIT (tracer), we CANNOT remove terms from the list based on value.
-                    # We can only zero them out (masking), but they still exist in the graph.
-                    #
-                    # BUT, Pauli propagation is inherently dynamic structure.
-                    # This means we CANNOT JIT compile the `propagate` function if truncation depends on dynamic values.
-                    #
-                    # Strategy:
-                    # 1. If we are not JITing (concrete values), we filter.
-                    # 2. If we are JITing (tracers), we CANNOT filter list length.
-                    #    We can only multiply by a mask: coeff = coeff * (abs(coeff) >= threshold).
-                    #    This keeps the term but with 0 coefficient.
+                    # Damping Truncation Logic
+                    # If damping > 0, we require larger coefficients for larger weights.
+                    # Threshold = min_abs_coeff * 10^(damping * weight)
+                    
+                    current_threshold = min_abs_coeff
+                    if damping > 0:
+                        term_weight = len(term.paulis)
+                        current_threshold = min_abs_coeff * (10.0 ** (damping * term_weight))
+                    
+                    # ... (rest of logic using current_threshold instead of min_abs_coeff)
                     
                     is_tracer = hasattr(term.coefficient, 'aval') or hasattr(term.coefficient, 'tracer')
                     
                     if not is_tracer:
                         # Concrete value execution (eager mode)
-                        if jnp.abs(term.coefficient) < min_abs_coeff:
+                        if jnp.abs(term.coefficient) < current_threshold:
                             keep = False
                     else:
                         # JIT/Traced execution
                         # We cannot change the list structure based on values.
-                        # We keep the term but zero out its coefficient if it's small.
-                        # Note: This defeats the speedup purpose of truncation (reducing terms),
-                        # but allows JIT to run.
-                        # To truly get speedup, one must not JIT the propagation structure logic,
-                        # or use static parameters that don't change.
-                        #
-                        # However, for hybrid training, parameters change, so coefficients change.
-                        # So the set of Pauli strings would change dynamically.
-                        # JAX JIT requires static graph structure.
-                        #
-                        # Conclusion: Dynamic truncation based on coefficients is incompatible with JAX JIT
-                        # if we want to actually remove terms from the list to save compute.
-                        #
-                        # For this specific error, we will use a mask for Tracers.
-                        mask = (jnp.abs(term.coefficient) >= min_abs_coeff).astype(term.coefficient.dtype)
+                        mask = (jnp.abs(term.coefficient) >= current_threshold).astype(term.coefficient.dtype)
                         term.coefficient = term.coefficient * mask
                         # We keep the term (it has 0 coeff now if truncated)
                         keep = True
