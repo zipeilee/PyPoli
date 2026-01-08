@@ -332,7 +332,7 @@ class RX(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        self.theta = jnp.asarray(theta, dtype=jnp.float32)
         self.generator_mask = PauliString._pauli_to_bit['X']
 
     def pauli_action(self, pauli_str) -> List:
@@ -372,7 +372,7 @@ class RY(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        self.theta = jnp.asarray(theta, dtype=jnp.float32)
         self.generator_mask = PauliString._pauli_to_bit['Y']
 
     def pauli_action(self, pauli_str) -> List:
@@ -410,7 +410,7 @@ class RZ(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        self.theta = jnp.asarray(theta, dtype=jnp.float32)
         self.generator_mask = PauliString._pauli_to_bit['Z']
 
     def pauli_action(self, pauli_str) -> List:
@@ -449,7 +449,7 @@ class RXX(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        self.theta = jnp.asarray(theta, dtype=jnp.float32)
 
     def pauli_action(self, pauli_str) -> List:
         q0, q1 = self.qubits
@@ -493,7 +493,7 @@ class RYY(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        self.theta = jnp.asarray(theta, dtype=jnp.float32)
 
     def pauli_action(self, pauli_str) -> List:
         q0, q1 = self.qubits
@@ -528,7 +528,7 @@ class RZZ(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float64)
+        self.theta = jnp.asarray(theta, dtype=jnp.float32)
 
     def pauli_action(self, pauli_str) -> List:
         q0, q1 = self.qubits

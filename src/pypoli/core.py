@@ -28,7 +28,7 @@ class PauliString:
         """
         # Store only non-identity operators
         self.paulis = {q: p for q, p in paulis.items() if p != 'I'}
-        self.coefficient = jnp.asarray(coefficient, dtype=jnp.complex128)
+        self.coefficient = jnp.asarray(coefficient, dtype=jnp.complex64)
 
     def __repr__(self):
         if not self.paulis:

@@ -8,6 +8,7 @@ import sys
 import os
 import time
 import numpy as np
+from typing import Callable
 
 # Add src to path
 sys.path.append(os.path.abspath("./src"))
@@ -15,13 +16,13 @@ sys.path.append(os.path.abspath("./src"))
 from pypoli import Circuit, PauliString, expectation_value, PauliSum
 from pypoli import RY, CNOT
 
-# Enable x64 for precision
-jax.config.update("jax_enable_x64", True)
+# Enable x32 for performance
+jax.config.update("jax_enable_x64", False)
 
 class QuantumLayer(nn.Module):
     """
     A Flax module wrapping a quantum circuit using jax.lax.scan for fast compilation.
-    
+
     Structure:
     1. Encoding: RY(x_i) on each qubit.
     2. Ansatz: Hardware Efficient Ansatz with trainable parameters.
@@ -31,51 +32,46 @@ class QuantumLayer(nn.Module):
     depth: int
     max_weight: int = 2  # Hardcoded for basis generation
     min_abs_coeff: float = 1e-3
+    entangling_gate: Callable = CNOT  # 可配置的纠缠门
+    rotation_gate: Callable = RY      # 可配置的旋转门
 
-    @nn.compact
-    def __call__(self, x):
-        # x shape: (batch_size, n_qubits)
-        
-        # Initialize trainable parameters for the ansatz
-        params = self.param('circuit_params', 
-                          nn.initializers.uniform(scale=2*jnp.pi), 
-                          (self.depth, self.n_qubits))
-        
-        # --- Precompute Basis for Weight <= 2 ---
-        # We need a fixed basis to use scan.
-        # Basis includes Identity, all 1-body Paulis, all 2-body Paulis.
-        
+    def setup(self):
+        # Precompute basis once during setup
         from itertools import combinations
-        
+
         # Helper to create PauliString
         def ps(qubit_paulis):
-            # qubit_paulis: dict {qubit_idx: 'X'/'Y'/'Z'}
             return PauliString(qubit_paulis, 1.0)
-            
+
         basis = []
         basis.append(ps({})) # Identity
-        
+
         # 1-body
         for i in range(self.n_qubits):
             for p in ['X', 'Y', 'Z']:
                 basis.append(ps({i: p}))
-                
+
         # 2-body
         if self.max_weight >= 2:
             for i, j in combinations(range(self.n_qubits), 2):
                 for p1 in ['X', 'Y', 'Z']:
                     for p2 in ['X', 'Y', 'Z']:
                         basis.append(ps({i: p1, j: p2}))
-                        
-        basis_len = len(basis)
-        # print(f"Basis size: {basis_len}") # Cannot print in JIT
-        
-        # Create a mapping from "canonical signature" to index
-        # Signature: tuple of sorted (qubit, pauli_char)
-        basis_map = {}
-        for idx, term in enumerate(basis):
-            sig = tuple(sorted(term.paulis.items()))
-            basis_map[sig] = idx
+
+        self.basis = basis
+        self.basis_map = {tuple(sorted(term.paulis.items())): idx for idx, term in enumerate(basis)}
+        self.basis_len = len(basis)
+
+    @nn.compact
+    def __call__(self, x):
+        # Validate input shape
+        assert x.shape[1] == self.n_qubits, \
+            f"Input feature size {x.shape[1]} must match number of qubits {self.n_qubits}"
+
+        # Initialize trainable parameters for the ansatz
+        params = self.param('circuit_params',
+                          nn.initializers.uniform(scale=2*jnp.pi),
+                          (self.depth, self.n_qubits))
 
         # --- Define Scan Step Function ---
         def scan_step(carry, layer_param):
@@ -100,10 +96,10 @@ class QuantumLayer(nn.Module):
             layer_circuit = Circuit()
             # Entangling
             for i in range(self.n_qubits - 1):
-                layer_circuit.add_gate(CNOT(i, i+1))
+                layer_circuit.add_gate(self.entangling_gate(i, i+1))
             # Rotations
             for i in range(self.n_qubits):
-                layer_circuit.add_gate(RY(i, layer_param[i]))
+                layer_circuit.add_gate(self.rotation_gate(i, layer_param[i]))
             
             # Propagate each basis element through this layer
             # This produces a linear map (Matrix).
@@ -121,42 +117,42 @@ class QuantumLayer(nn.Module):
             # This is much better than propagating 25 layers deep * term growth.
             
             # Let's try to construct the output vector.
-            new_coeffs = jnp.zeros(basis_len, dtype=jnp.float64)
-            
+            new_coeffs = jnp.zeros(self.basis_len, dtype=jnp.float32)
+
             # We iterate over the input basis terms that have non-zero coefficients.
             # In JIT, we must iterate over ALL basis terms.
-            # This might be slow if basis is large. 
+            # This might be slow if basis is large.
             # 436 is acceptable.
-            
+
             # Actually, pypoli's propagate function works on a List of PauliStrings.
             # We can reconstruct the "current state" as a list of PauliStrings with coeffs from 'carry'.
-            
+
             # Reconstructing input terms (only symbolic, coeffs come from carry)
             input_terms = []
-            for idx, term in enumerate(basis):
+            for idx, term in enumerate(self.basis):
                 # Create a NEW PauliString with coefficient from carry[idx]
                 # We need to be careful: PauliString.coefficient should be a JAX Tracer.
                 new_term = PauliString(term.paulis, carry[idx])
                 input_terms.append(new_term)
-            
+
             # Propagate through the layer
             # We use truncation inside propagate to keep things sparse if possible,
             # but here we are mapping back to basis, so we just want the result.
             # Max weight is already handled by our basis definition, but intermediate terms might grow.
             # We let pypoli handle intermediate growth, then we project back.
-            
+
             propagated_terms = layer_circuit.propagate(
-                PauliSum(input_terms), 
+                PauliSum(input_terms),
                 max_weight=self.max_weight + 1 # Allow slight intermediate growth
             )
-            
+
             # Project back to Basis
             # propagated_terms is a list of PauliStrings.
             # We sum their coefficients into the corresponding slots in new_coeffs.
-            
+
             # We can't mutate new_coeffs in place in JAX easily.
             # We collect updates.
-            
+
             # This part is tricky in JAX because propagated_terms structure depends on values if we use truncation.
             # BUT we set pypoli to NOT truncate by coefficient (min_abs_coeff=0 or None inside scan),
             # only by weight.
@@ -166,21 +162,21 @@ class QuantumLayer(nn.Module):
             # The only variable is the rotation angles.
             # Rotation angles affect coefficients, not which Pauli strings are generated (structurally).
             # RY gate: Y -> Y, Z -> Z*cos + X*sin. Structure is fixed (sum of terms).
-            
+
             # So `propagated_terms` is a static list of PauliStrings with Tracer coefficients.
-            
+
             # We map these back to new_coeffs.
             updates_indices = []
             updates_values = []
-            
+
             for term in propagated_terms:
                 sig = tuple(sorted(term.paulis.items()))
-                if sig in basis_map:
-                    idx = basis_map[sig]
+                if sig in self.basis_map:
+                    idx = self.basis_map[sig]
                     updates_indices.append(idx)
                     updates_values.append(term.coefficient)
                 # Else: term is outside basis (truncated)
-            
+
             if updates_indices:
                 new_coeffs = new_coeffs.at[jnp.array(updates_indices)].add(jnp.array(updates_values))
             
@@ -196,49 +192,49 @@ class QuantumLayer(nn.Module):
             # Map input observable (Z_i Z_{i+1}) backwards through Encoding Layer first?
             # No, standard is: State |0> -> Enc(x) -> Ansatz -> Measure.
             # Heisenberg: Measure -> Ansatz^dag -> Enc^dag -> |0>.
-            
+
             # We are propagating the Observable O.
             # O' = U^dag O U.
             # U = Ansatz * Enc.
             # O' = Enc^dag * Ansatz^dag * O * Ansatz * Enc.
             # In pypoli propagate, we add gates in reverse order of application.
             # So we add Ansatz gates (reversed), then Enc gates (reversed).
-            
+
             # Here we use scan for Ansatz.
             # So we start with Observable O.
             # Propagate through Ansatz (reversed layers).
             # Then propagate through Enc.
             # Then take expectation with |0> (which is just the coeff of Identity term).
-            
+
             # Measurement Loop
             expectations = []
             for i in range(self.n_qubits - 1):
                 # Initial Observable: Z_i Z_{i+1}
                 target_sig = tuple(sorted({i: 'Z', i+1: 'Z'}.items()))
-                target_idx = basis_map.get(target_sig)
-                
+                target_idx = self.basis_map.get(target_sig)
+
                 if target_idx is None:
                     # Should not happen if basis covers 2-body
                     expectations.append(0.0)
                     continue
-                
+
                 # Initial coeff vector
-                init_coeffs = jnp.zeros(basis_len, dtype=jnp.float64)
+                init_coeffs = jnp.zeros(self.basis_len, dtype=jnp.float32)
                 init_coeffs = init_coeffs.at[target_idx].set(1.0)
-                
+
                 # SCAN through Ansatz Layers
                 # We need to iterate layers in REVERSE order for Heisenberg propagation.
                 # circuit_params shape: (depth, n_qubits)
                 # We reverse it along axis 0
                 rev_params = circuit_params[::-1]
-                
+
                 final_coeffs, _ = jax.lax.scan(scan_step, init_coeffs, rev_params)
-                
+
                 # Now propagate through Encoding Layer
                 # This is just one layer, no need for scan
                 # Reconstruct PauliSum
                 input_terms = []
-                for idx, term in enumerate(basis):
+                for idx, term in enumerate(self.basis):
                     # Only add if coeff is non-negligible to save compute?
                     # Inside JIT we can't condition on value.
                     new_term = PauliString(term.paulis, final_coeffs[idx])
@@ -290,17 +286,21 @@ class HybridModel(nn.Module):
     output_dim: int
     max_weight: int = 4  # Truncation parameter
     min_abs_coeff: float = 1e-3  # Truncation parameter
+    entangling_gate: Callable = CNOT  # 可配置的纠缠门
+    rotation_gate: Callable = RY      # 可配置的旋转门
 
     @nn.compact
     def __call__(self, x):
         # x: (batch, n_qubits)
-        
+
         # Quantum Layer
         # Output shape: (batch, n_qubits - 1)
-        q_out = QuantumLayer(n_qubits=self.n_qubits, 
+        q_out = QuantumLayer(n_qubits=self.n_qubits,
                            depth=self.q_depth,
                            max_weight=self.max_weight,
-                           min_abs_coeff=self.min_abs_coeff)(x)
+                           min_abs_coeff=self.min_abs_coeff,
+                           entangling_gate=self.entangling_gate,
+                           rotation_gate=self.rotation_gate)(x)
         
         # Classical MLP
         # We can treat q_out as features
