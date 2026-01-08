@@ -425,6 +425,61 @@ class JITPropagator:
 
 # --- 4. Public API ---
 
+def compile_expectation_fn(
+    circuit: Circuit,
+    n_qubits: int,
+    max_weight: int,
+    observables: Union[PauliSum, List[PauliString], List[PauliSum]],
+):
+    """
+    Compile a JIT-compatible function that computes expectation values.
+    
+    Args:
+        circuit: The Quantum Circuit (with Parameters).
+        n_qubits: Number of qubits.
+        max_weight: Max Pauli weight for truncation.
+        observables: Either a single Observable (returns scalar) or list (returns vector).
+        
+    Returns:
+        forward_fn(params) -> result
+        
+        - If observables is single: result is scalar (float).
+        - If observables is list: result is array (shape: [n_obs]).
+        - params must be a flat array matching the order of Parameters in the circuit.
+    """
+    propagator = JITPropagator(n_qubits, max_weight)
+    
+    # 1. Compile Ops (Reverse for Heisenberg Picture)
+    layer_ops, _ = propagator.compile_layer_ops(circuit.gates)
+    flat_step = propagator.make_flat_step(layer_ops[::-1])
+    diag_mask = propagator.get_diagonal_mask()
+    
+    # 2. Handle Observables
+    is_list = isinstance(observables, list)
+    
+    if is_list:
+        # Vector Output
+        obs_coeffs = jnp.stack([propagator.map_observable(o) for o in observables])
+        # vmap over observables (axis 0 of obs_coeffs), params are shared (None)
+        batch_step = jax.vmap(flat_step, in_axes=(0, None))
+        
+        def _forward(params):
+            final_vecs = batch_step(obs_coeffs, params)
+            # Sum diagonal elements
+            res = jnp.sum(jnp.where(diag_mask, final_vecs, 0.0), axis=1)
+            return jnp.real(res)
+            
+    else:
+        # Scalar Output
+        init_coeffs = propagator.map_observable(observables)
+        
+        def _forward(params):
+            final_coeffs = flat_step(init_coeffs, params)
+            res = jnp.sum(jnp.where(diag_mask, final_coeffs, 0.0))
+            return jnp.real(res)
+            
+    return jax.jit(_forward)
+
 def make_jit_loss_fn(
     circuit: Union[Callable, Circuit], 
     n_qubits: int = None, 
@@ -434,16 +489,7 @@ def make_jit_loss_fn(
 ):
     """
     Create a JIT-compiled loss function for VQE.
-    
-    Args:
-        circuit: Either a Circuit object (Standard Mode) or a structure function (Legacy Layer Mode).
-        n_qubits: Number of qubits (optional if circuit is Circuit object).
-        max_weight: Max Pauli weight to truncate.
-        observable: PauliSum or list of PauliStrings.
-        n_layers: Number of layers to repeat (Only for Legacy Mode).
-        
-    Returns:
-        loss_fn(params) -> energy
+    Wrapper around compile_expectation_fn for backward compatibility.
     """
     
     # 1. Detect Mode
@@ -454,124 +500,15 @@ def make_jit_loss_fn(
             raise ValueError("n_qubits and n_layers must be provided for function-based circuit structure.")
         return _make_jit_loss_fn_legacy(circuit, n_qubits, max_weight, observable, n_layers)
     
-    # 2. Standard Mode (Circuit Object)
+    # 2. Standard Mode
     if isinstance(circuit, Circuit):
         if n_qubits is None:
             n_qubits = circuit.n_qubits
     else:
-        # Maybe list of gates?
         raise ValueError("Circuit must be a Circuit object or a callable.")
         
-    propagator = JITPropagator(n_qubits, max_weight)
-    
-    # 1. Map Observable (Initial Vector for Heisenberg)
-    init_coeffs = propagator.map_observable(observable)
-    
-    # 2. Compile Flat Circuit
-    # We treat the circuit as a single sequence of gates.
-    # Parameterized gates (via Parameter objects) will map to input params array indices.
-    
-    # We assume parameters are bound by index of appearance in circuit.
-    # Or, does the user pass a dictionary? 
-    # Standard VQE usually passes a flat array.
-    # We will collect all unique Parameter objects and map them.
-    
-    # Actually, simpler: Iterate gates. If gate.theta is Parameter, assign p_idx++.
-    # The input params array must match this order.
-    
-    layer_ops, total_params = propagator.compile_layer_ops(circuit.gates)
-    
-    # 3. Create Step Function (No Scan, Flat Execution)
-    flat_step = propagator.make_flat_step(layer_ops)
-    
-    # 4. Diagonal Mask
-    diag_mask = propagator.get_diagonal_mask()
-    
-    # 5. Define Loss Function
-    def loss_fn(params):
-        # params shape: (total_params,)
-        
-        # Heisenberg: U^dag H U.
-        # If circuit is G_m ... G_1.
-        # We need G_1^dag ... G_m^dag H G_m ... G_1.
-        # This corresponds to applying gates in REVERSE order: G_m, ..., G_1.
-        # My `layer_ops` preserves gate order (0 to m).
-        # So we should REVERSE the ops?
-        # Wait.
-        # Forward: |psi> = G_m ... G_1 |0>
-        # Energy = <psi|H|psi> = <0| G_1^dag ... G_m^dag H G_m ... G_1 |0>
-        # Heisenberg: H_0 = H.
-        # H_k = G_k^dag H_{k-1} G_k.
-        # So we apply G_m, then G_{m-1}, ..., G_1.
-        # So we iterate gates in REVERSE order of application.
-        # My `compile_layer_ops` processes gates in list order.
-        # So if `circuit.gates` is [G1, G2, ..., Gm].
-        # `layer_ops` is [Op1, Op2, ..., Opm].
-        # We want to apply Opm, then Opm-1, ...
-        # So we should reverse `layer_ops` before creating step?
-        # Or reverse inside step?
-        
-        # Also, parameters need to be mapped correctly.
-        # If G1 has p1, G2 has p2.
-        # Params input: [p1, p2].
-        # Reverse execution: G2(p2), G1(p1).
-        # My compiler assigns p_idx based on list order.
-        # Op1 has p_idx=0. Op2 has p_idx=1.
-        # If we reverse ops: [Op2, Op1].
-        # Op2 uses p_idx=1. Op1 uses p_idx=0.
-        # So params[1] and params[0]. Correct.
-        
-        # BUT, standard VQE optimizes params.
-        # The sign of theta?
-        # Gdag(theta) = G(-theta).
-        # My logic uses sin(theta).
-        # P -> Gdag P G ? No.
-        # Heisenberg: H_new = U^dag H U.
-        # If U = exp(-i t P/2). U^dag = exp(i t P/2).
-        # U^dag H U = exp(i t P/2) H exp(-i t P/2).
-        # = H + i [t P/2, H] ...
-        # = H - i t/2 [H, P] ...
-        # My logic (Forward): P -> P + P(cos-1) + P'(sin).
-        # This matches G P Gdag.
-        # So I am computing G P Gdag.
-        # I need Gdag P G.
-        # So I should use -theta.
-        
-        # So, for Heisenberg picture:
-        # 1. Reverse gate order.
-        # 2. Negate theta.
-        
-        # Since VQE learns theta, the negation is absorbed.
-        # But the ORDER is critical.
-        
-        # NOTE: `compile_layer_ops` returns ops in Forward order.
-        # We need to reverse them for Heisenberg back-propagation.
-        # We can reverse the list here efficiently.
-        
-        # However, `compile_layer_ops` already compiled them.
-        # Reversing a list of dicts is cheap.
-        
-        ops_reversed = layer_ops[::-1]
-        
-        # Execute
-        final_vec = flat_step(init_coeffs, params) # params are passed as is.
-        # But wait, `flat_step` iterates `layer_ops` which is closed over in the function.
-        # I cannot change `layer_ops` after `make_flat_step` is called?
-        # Ah, `make_flat_step` creates a closure over `layer_ops`.
-        # So I should pass reversed ops to `make_flat_step`.
-        
-        # Wait, if I create `flat_step` inside `make_jit_loss_fn` before defining `loss_fn`,
-        # I need to decide on reversal there.
-        # Yes.
-        
-        # Project
-        energy = jnp.sum(jnp.where(diag_mask, final_vec, 0.0))
-        return jnp.real(energy)
-
-    # Re-create step with REVERSED ops for Heisenberg
-    flat_step = propagator.make_flat_step(layer_ops[::-1])
-    
-    return loss_fn
+    forward_fn = compile_expectation_fn(circuit, n_qubits, max_weight, observable)
+    return forward_fn
 
 def _make_jit_loss_fn_legacy(
     circuit_structure_fn: Callable, 

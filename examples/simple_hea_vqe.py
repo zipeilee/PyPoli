@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import optax
 import time
 import warnings
-from pypoli.jit_propagation import make_jit_loss_fn
+from pypoli.jit_propagation import compile_expectation_fn
 from pypoli.core import PauliString, PauliSum, Parameter
 from pypoli.gates import RX, RZ, CNOT
 from pypoli.circuits import Circuit
@@ -64,12 +64,12 @@ for d in range(DEPTH):
 print("Compiling JIT Loss Function...")
 t0 = time.time()
 
-# Now we pass the Circuit object directly!
-loss_fn = make_jit_loss_fn(
+# Now we use the unified compile_expectation_fn!
+loss_fn = compile_expectation_fn(
     circuit=circuit,
-    n_qubits=N_QUBITS, # Need to pass n_qubits explicitly as circuit doesn't store it
+    n_qubits=N_QUBITS,
     max_weight=MAX_WEIGHT,
-    observable=observable
+    observables=observable
 )
 print(f"Compilation/Pre-computation Done in {time.time()-t0:.2f}s")
 

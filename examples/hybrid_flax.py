@@ -41,21 +41,14 @@ def get_quantum_layer_fn(n_qubits, depth, max_weight):
             circuit.add(CNOT(i, i + 1))
         for q in range(n_qubits):
             circuit.add(RY(q, Parameter(f"ansatz_{d}_{q}")))
-    from pypoli.jit_propagation import JITPropagator
-    propagator = JITPropagator(n_qubits, max_weight)
-    layer_ops, _ = propagator.compile_layer_ops(circuit.gates)
-    flat_step = propagator.make_flat_step(layer_ops[::-1])
-    n_obs = n_qubits - 1
-    obs_coeffs = jnp.zeros((n_obs, propagator.basis.size + 1), dtype=jnp.complex64)
-    for i in range(n_obs):
-        vec = propagator.map_observable(PauliString({i: 'Z', i + 1: 'Z'}, 1.0))
-        obs_coeffs = obs_coeffs.at[i].set(vec)
-    diag_mask = propagator.get_diagonal_mask()
-    batch_step = jax.vmap(flat_step, in_axes=(0, None))
-    def _compute_expectations(combined_params):
-        final_vecs = batch_step(obs_coeffs, combined_params)
-        return jnp.real(jnp.sum(jnp.where(diag_mask, final_vecs, 0.0), axis=1))
-    compute_expectations = jax.jit(_compute_expectations)
+    from pypoli.jit_propagation import compile_expectation_fn
+    
+    # Define observables: Z_i Z_{i+1} for i in range(n_qubits-1)
+    observables = []
+    for i in range(n_qubits - 1):
+        observables.append(PauliString({i: 'Z', i + 1: 'Z'}, 1.0))
+        
+    compute_expectations = compile_expectation_fn(circuit, n_qubits, max_weight, observables)
 
     _QUANTUM_CACHE[cache_key] = compute_expectations
     param_len = n_qubits + depth * n_qubits
