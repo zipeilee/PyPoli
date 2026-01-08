@@ -82,4 +82,43 @@ $$ \mathcal{B} = \{ I, X_1, \dots, Z_N, X_1 X_2, \dots, Z_{N-1} Z_N \} $$
 
 1.  **结构决定速度**: 要利用 JAX 处理离散/稀疏问题（如 Pauli 串），必须将其映射为静态、稠密的表示（向量/矩阵）。
 2.  **为速度而近似**: 对于训练任务，“精确”模拟往往是多余的。投影到物理上合理的子空间（低权重 Pauli）可以在保留变分学习所需物理特性的同时，实现巨大的加速。
-3.  **Scan 是必须的**: 对于 JAX 中的任何深层序列模型（RNN、深层线路、时间演化），为了避免编译时间爆炸，使用 `jax.lax.scan` 是强制性的。
+3. **Scan 是必须的**: 对于 JAX 中的任何深层序列模型（RNN、深层线路、时间演化），为了避免编译时间爆炸，使用 `jax.lax.scan` 是强制性的。
+
+---
+
+## 5. Flax/Haiku 集成最佳实践
+
+在将 PyPoli 集成到 Flax 或 Haiku 等神经网络库时，需特别注意**避免重复编译 (Re-compilation)**。
+
+### 5.1 常见陷阱
+在 `nn.Module.__call__` 中直接构建线路或调用 `jax.jit` 装饰的函数，往往会导致 JAX 在每一轮训练迭代中重新追踪 (Trace)，因为 Flax 的参数 Tracer 对象在每次更新后都会改变，导致 JIT 缓存失效。
+
+### 5.2 解决方案：全局缓存与闭包
+**不要**在 Module 的 forward pass 中编译。**要**使用全局工厂函数：
+
+1.  **全局缓存**: 使用字典 `_CACHE = {}` 存储已编译的函数。
+2.  **工厂函数**: `get_compiled_fn(config)` 检查缓存，如果未命中则构建线路、定义 `scan` 循环并应用 `jax.jit`，然后存入缓存。
+3.  **Module 调用**: 在 `__call__` 中获取这个预编译的函数，仅将当前的参数 (Params) 和输入 (Inputs) 传入。
+
+```python
+# 错误示范
+class BadLayer(nn.Module):
+    def __call__(self, x):
+        # 每次都会重新运行这部分 Python 代码，甚至触发重新编译
+        circuit = make_circuit() 
+        return jax.jit(propagate)(circuit, x)
+
+# 正确示范
+def get_cached_fn(config):
+    if config in _CACHE: return _CACHE[config]
+    # ... build & jit ...
+    _CACHE[config] = compiled_fn
+    return compiled_fn
+
+class GoodLayer(nn.Module):
+    def __call__(self, x):
+        fn = get_cached_fn(self.config)
+        return fn(x, self.params)
+```
+
+这种模式确保了编译只发生一次（通常在程序启动或第一次 forward 时），随后的训练步骤都是纯粹的 XLA 执行，速度极快。

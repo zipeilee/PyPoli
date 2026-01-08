@@ -62,3 +62,31 @@ Implement a performant Hybrid Quantum-Classical Neural Network using `flax` and 
 
 ### 5. Documentation
 - Created `JAX_Quantum_Optimization_Note.md` (Chinese & English) detailing the optimization strategy and theoretical background.
+
+## Session: Hybrid Flax Integration & Performance Tuning (2026-01-08)
+
+### 1. Issue Identification
+The previous "Hybrid Flax" implementation suffered from severe performance degradation during training loops.
+- **Re-JIT on Every Step**: The Flax `Module` was re-tracing the quantum computation graph on every iteration, leading to massive overhead (seconds per step instead of milliseconds).
+- **Initialization Latency**: The first step of training had a huge pause due to unoptimized compilation triggers.
+- **VMap Overhead**: Manual loop over batch dimension was inefficient compared to proper `jax.vmap`.
+
+### 2. Implementation Changes
+
+#### A. Global Compilation Cache (`examples/hybrid_flax.py`)
+- **Decoupled Compilation**: Moved the circuit construction and JIT compilation logic *outside* the Flax Module into a global `get_quantum_layer_fn` with caching `_QUANTUM_CACHE`.
+- **Singleton Pattern**: Ensures that for a given configuration `(n_qubits, depth, max_weight)`, the circuit is built and compiled exactly once per process.
+
+#### B. Pure JAX Optimization
+- **Pre-warming**: Added a dummy execution step immediately after JIT compilation to force XLA compilation before the training loop starts. This eliminates the "Step 0" lag.
+- **Batch Propagation**: Implemented `jax.vmap` at the lowest level of the propagator step, allowing parallel processing of the entire batch of inputs.
+- **DType Unification**: Standardized on `complex64` to reduce memory bandwidth and align with TPUs/GPUs.
+
+#### C. Algorithmic Stability
+- **Reverted to Pauli Propagation**: Explicitly rejected full state-vector simulation approaches in favor of the Truncated Pauli Propagation method (Heisenberg picture).
+- **Weight Truncation**: Strictly enforced `max_weight` truncation to maintain $O(Poly(N))$ complexity instead of $O(2^N)$.
+
+### 3. Results
+- **Training Speed**: Training steps are now consistently fast (~milliseconds) after the initial pre-warm.
+- **Stability**: Removed "re-compiling" log messages during the training loop.
+- **Correctness**: Maintained the physical truncation logic requested by the user.
