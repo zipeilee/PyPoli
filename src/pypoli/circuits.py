@@ -11,7 +11,7 @@ class Circuit:
     Quantum circuit implementation with Pauli propagation support.
     """
 
-    def __init__(self, gates: List[Gate] = None, structure=None, params=None):
+    def __init__(self, gates: List[Gate] | None = None, structure=None, params=None):
         """
         Initialize a quantum circuit.
 
@@ -130,7 +130,8 @@ class Circuit:
 
                 # Apply weight truncation if specified
                 if max_weight is not None:
-                    term_weight = len(term.paulis)  # Number of non-identity Paulis
+                    # Use bit counting for faster weight calculation
+                    term_weight = term.bits.bit_count() // 2  # Each non-I Pauli uses 2 bits
                     if term_weight > max_weight:
                         keep = False
 
@@ -142,7 +143,8 @@ class Circuit:
                     
                     current_threshold = min_abs_coeff
                     if damping > 0:
-                        term_weight = len(term.paulis)
+                        # Use bit counting for faster weight calculation
+                        term_weight = term.bits.bit_count() // 2
                         current_threshold = min_abs_coeff * (10.0 ** (damping * term_weight))
                     
                     # ... (rest of logic using current_threshold instead of min_abs_coeff)
@@ -176,27 +178,19 @@ class Circuit:
 
             # Deduplication / Merging of terms
             # This is crucial for performance to prevent exponential growth of redundant terms.
-            # We group by Pauli string signature (dict keys) and sum coefficients.
-            # In JIT mode, this "sum" will be a sum of Tracers.
-            
+            # We group by Pauli string signature (bits) and sum coefficients.
+
             merged_terms = {}
             for term in filtered:
-                # PauliString needs to be hashable or have a unique string rep.
-                # Assuming str(term) or term.paulis (frozenset/tuple) is a good key.
-                # PauliString.paulis is a dict {qubit: 'X/Y/Z'}. We can make it a tuple of sorted items.
-                
-                # Create a canonical key for the Pauli operator part (ignoring coefficient)
-                # Sort by qubit index
-                sorted_items = tuple(sorted(term.paulis.items()))
-                key = sorted_items 
-                
+                # Use bits directly as key - much faster than dict conversion
+                key = (term.bits, term.nqubits)
+
                 if key in merged_terms:
                     # Sum coefficients
                     merged_terms[key].coefficient = merged_terms[key].coefficient + term.coefficient
                 else:
-                    # Store the term (we clone it to be safe, though not strictly necessary if we don't mutate in place elsewhere)
                     merged_terms[key] = term
-            
+
             current_terms = list(merged_terms.values())
 
         return current_terms
