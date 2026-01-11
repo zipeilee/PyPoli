@@ -3,7 +3,7 @@ Quantum gates implementation with Pauli action rules (JAX-only)
 """
 import jax
 import jax.numpy as jnp
-from typing import List, Any
+from typing import List, Any, Union
 
 from .core import PauliString
 
@@ -11,7 +11,7 @@ from .core import PauliString
 # For each gate, we define a lookup table that maps:
 #   (input_pauli_bits) -> (output_pauli_bits, phase)
 # Pauli bit encoding (2 bits per Pauli): I=00(0), X=01(1), Y=10(2), Z=11(3)
-clifford_map = {
+clifford_map: dict[str, list[tuple[int, int] | None]] = {
     # I gate: identity on all Paulis
     'I': [(0, 1), (1, 1), (2, 1), (3, 1)],
 
@@ -113,7 +113,7 @@ clifford_map['CNOT'] = [
 ]
 # Wait, the index of the list IS the input bits.
 # So I must place the result at the correct index.
-cnot_list = [None] * 16
+cnot_list: list[tuple[int, int] | None] = [None] * 16
 cnot_list[0x00] = (0x00, 1)
 cnot_list[0x01] = (0x05, 1)
 cnot_list[0x02] = (0x06, 1)
@@ -150,7 +150,7 @@ clifford_map['CNOT'] = cnot_list
 # 0x0E (Y-Z) -> 0x02 (Y-I)
 # 0x0F (Z-Z) -> 0x0F
 
-cz_list = [None] * 16
+cz_list: list[tuple[int, int] | None] = [None] * 16
 cz_list[0x00] = (0x00, 1)
 cz_list[0x01] = (0x0D, 1)
 cz_list[0x02] = (0x0E, 1)
@@ -170,6 +170,14 @@ cz_list[0x0F] = (0x0F, 1)
 clifford_map['CZ'] = cz_list
 
 
+class Parameter:
+    """A symbolic parameter for parameterized gates."""
+    def __init__(self, name: str):
+        self.name = name
+    
+    def __repr__(self):
+        return f"Parameter('{self.name}')"
+
 class Gate:
     """
     Base class for all quantum gates.
@@ -183,8 +191,29 @@ class Gate:
             qubits: Tuple of qubit indices this gate acts on
         """
         self.qubits = qubits
+        # Subclasses with parameters should populate this list with their parameter names
+        # in the order they appear in the constructor args.
+        # e.g. RX(q, theta) -> self.params = [theta]
+        # But wait, theta might be a float or a Parameter object.
+        # We need to distinguish.
+        self.params = [] 
+
+    def bind_parameters(self, param_values: list) -> 'Gate':
+        """
+        Return a new gate with parameters bound to values.
+        Takes a list of values and consumes them in order.
+        Returns the new gate.
+        Note: The caller is responsible for slicing the correct values.
+        Actually, for simplicity, let's just pass the map?
+        No, user wants implicit binding.
+        
+        So we pass a list of values. But how does the gate know WHICH values?
+        The caller (Circuit.propagate) iterates over gates and parameters simultaneously.
+        """
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+
         """
         Action of this gate on a Pauli string.
 
@@ -298,32 +327,31 @@ class T(Gate):
         # T commutes with I and Z.
         # X -> X cos(pi/4) + Y sin(pi/4)
         # Y -> Y cos(pi/4) - X sin(pi/4)
-        
+
         pauli_bits = pauli_str.get_pauli_bit(self.qubits)
 
         cos_val = jnp.cos(self.theta)
         sin_val = jnp.sin(self.theta)
 
-        if pauli_bits == PauliString._pauli_to_bit['I'] or pauli_bits == PauliString._pauli_to_bit['Z']:
+        if pauli_bits == 0 or pauli_bits == 3:  # I or Z
             return [pauli_str]
-        elif pauli_bits == PauliString._pauli_to_bit['X']:
-            # X -> X cos - i sin (Z X) ? No.
+        elif pauli_bits == 1:  # X
             # T X Tdag = X cos + Y sin
-            x_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['X'], self.qubits)
-            y_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Y'], self.qubits)
+            x_pauli = pauli_str.set_pauli_bit(1, self.qubits)
+            y_pauli = pauli_str.set_pauli_bit(2, self.qubits)
             return [
-                type(pauli_str)(x_paulis.paulis, x_paulis.coefficient * cos_val),
-                type(pauli_str)(y_paulis.paulis, y_paulis.coefficient * sin_val)
+                PauliString(x_pauli.bits, x_pauli.coefficient * cos_val, x_pauli.nqubits),
+                PauliString(y_pauli.bits, y_pauli.coefficient * sin_val, y_pauli.nqubits)
             ]
-        elif pauli_bits == PauliString._pauli_to_bit['Y']:
+        elif pauli_bits == 2:  # Y
             # T Y Tdag = Y cos - X sin
-            y_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Y'], self.qubits)
-            x_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['X'], self.qubits)
+            y_pauli = pauli_str.set_pauli_bit(2, self.qubits)
+            x_pauli = pauli_str.set_pauli_bit(1, self.qubits)
             return [
-                type(pauli_str)(y_paulis.paulis, y_paulis.coefficient * cos_val),
-                type(pauli_str)(x_paulis.paulis, x_paulis.coefficient * (-sin_val))
+                PauliString(y_pauli.bits, y_pauli.coefficient * cos_val, y_pauli.nqubits),
+                PauliString(x_pauli.bits, x_pauli.coefficient * (-sin_val), x_pauli.nqubits)
             ]
-        return [pauli_str] # Should not happen
+        return [pauli_str]  # Should not happen
 
 
 # Single-qubit rotation gates
@@ -332,8 +360,21 @@ class RX(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float32)
+        
+        # Auto-convert string to Parameter
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta # Can be float, JAX array, or Parameter
         self.generator_mask = PauliString._pauli_to_bit['X']
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RX':
+        if isinstance(self.theta, Parameter):
+            # Consume one value
+            return RX(self.qubits[0], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
         pauli_bits = pauli_str.get_pauli_bit(self.qubits)
@@ -343,26 +384,33 @@ class RX(Gate):
 
         # For non-commuting cases (Y, Z)
         # P -> P cos(theta) - i sin(theta) (X P)
-        cos_val = jnp.cos(self.theta)
-        sin_val = jnp.sin(self.theta)
 
-        if pauli_bits == PauliString._pauli_to_bit['Y']:
+        # If theta is a Parameter, we cannot compute cos/sin yet.
+        # This method assumes bound parameters (concrete values or JAX tracers).
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+
+        theta_val = jnp.asarray(self.theta, dtype=jnp.float64)
+        cos_val = jnp.cos(theta_val)
+        sin_val = jnp.sin(theta_val)
+
+        if pauli_bits == 2:  # Y
             # X Y = iZ. -i sin (iZ) = sin Z.
             # Y -> Y cos + Z sin
-            y_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Y'], self.qubits)
-            z_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Z'], self.qubits)
+            y_pauli = pauli_str.set_pauli_bit(2, self.qubits)
+            z_pauli = pauli_str.set_pauli_bit(3, self.qubits)
             return [
-                type(pauli_str)(y_paulis.paulis, y_paulis.coefficient * cos_val),
-                type(pauli_str)(z_paulis.paulis, z_paulis.coefficient * sin_val)
+                PauliString(y_pauli.bits, y_pauli.coefficient * cos_val, y_pauli.nqubits),
+                PauliString(z_pauli.bits, z_pauli.coefficient * sin_val, z_pauli.nqubits)
             ]
-        elif pauli_bits == PauliString._pauli_to_bit['Z']:
+        elif pauli_bits == 3:  # Z
             # X Z = -iY. -i sin (-iY) = -sin Y.
             # Z -> Z cos - Y sin
-            z_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Z'], self.qubits)
-            y_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Y'], self.qubits)
+            z_pauli = pauli_str.set_pauli_bit(3, self.qubits)
+            y_pauli = pauli_str.set_pauli_bit(2, self.qubits)
             return [
-                type(pauli_str)(z_paulis.paulis, z_paulis.coefficient * cos_val),
-                type(pauli_str)(y_paulis.paulis, y_paulis.coefficient * (-sin_val))
+                PauliString(z_pauli.bits, z_pauli.coefficient * cos_val, z_pauli.nqubits),
+                PauliString(y_pauli.bits, y_pauli.coefficient * (-sin_val), y_pauli.nqubits)
             ]
         return [pauli_str]
 
@@ -372,8 +420,20 @@ class RY(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float32)
+        
+        # Auto-convert string to Parameter
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
         self.generator_mask = PauliString._pauli_to_bit['Y']
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RY':
+        if isinstance(self.theta, Parameter):
+            return RY(self.qubits[0], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
         pauli_bits = pauli_str.get_pauli_bit(self.qubits)
@@ -381,26 +441,30 @@ class RY(Gate):
         if pauli_bits == self.generator_mask or pauli_bits == 0:
             return [pauli_str]
 
-        cos_val = jnp.cos(self.theta)
-        sin_val = jnp.sin(self.theta)
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
 
-        if pauli_bits == PauliString._pauli_to_bit['X']:
+        theta_val = jnp.asarray(self.theta, dtype=jnp.float64)
+        cos_val = jnp.cos(theta_val)
+        sin_val = jnp.sin(theta_val)
+
+        if pauli_bits == 1:  # X
             # Y X = -iZ. -i sin (-iZ) = -sin Z
             # X -> X cos - Z sin
-            x_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['X'], self.qubits)
-            z_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Z'], self.qubits)
+            x_pauli = pauli_str.set_pauli_bit(1, self.qubits)
+            z_pauli = pauli_str.set_pauli_bit(3, self.qubits)
             return [
-                type(pauli_str)(x_paulis.paulis, x_paulis.coefficient * cos_val),
-                type(pauli_str)(z_paulis.paulis, z_paulis.coefficient * (-sin_val))
+                PauliString(x_pauli.bits, x_pauli.coefficient * cos_val, x_pauli.nqubits),
+                PauliString(z_pauli.bits, z_pauli.coefficient * (-sin_val), z_pauli.nqubits)
             ]
-        elif pauli_bits == PauliString._pauli_to_bit['Z']:
+        elif pauli_bits == 3:  # Z
             # Y Z = iX. -i sin (iX) = sin X
             # Z -> Z cos + X sin
-            z_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Z'], self.qubits)
-            x_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['X'], self.qubits)
+            z_pauli = pauli_str.set_pauli_bit(3, self.qubits)
+            x_pauli = pauli_str.set_pauli_bit(1, self.qubits)
             return [
-                type(pauli_str)(z_paulis.paulis, z_paulis.coefficient * cos_val),
-                type(pauli_str)(x_paulis.paulis, x_paulis.coefficient * sin_val)
+                PauliString(z_pauli.bits, z_pauli.coefficient * cos_val, z_pauli.nqubits),
+                PauliString(x_pauli.bits, x_pauli.coefficient * sin_val, x_pauli.nqubits)
             ]
         return [pauli_str]
 
@@ -410,8 +474,20 @@ class RZ(Gate):
 
     def __init__(self, qubit: int, theta: Any):
         super().__init__((qubit,))
-        self.theta = jnp.asarray(theta, dtype=jnp.float32)
+        
+        # Auto-convert string to Parameter
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
         self.generator_mask = PauliString._pauli_to_bit['Z']
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RZ':
+        if isinstance(self.theta, Parameter):
+            return RZ(self.qubits[0], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
         pauli_bits = pauli_str.get_pauli_bit(self.qubits)
@@ -419,26 +495,30 @@ class RZ(Gate):
         if pauli_bits == self.generator_mask or pauli_bits == 0:
             return [pauli_str]
 
-        cos_val = jnp.cos(self.theta)
-        sin_val = jnp.sin(self.theta)
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
 
-        if pauli_bits == PauliString._pauli_to_bit['X']:
+        theta_val = jnp.asarray(self.theta, dtype=jnp.float64)
+        cos_val = jnp.cos(theta_val)
+        sin_val = jnp.sin(theta_val)
+
+        if pauli_bits == 1:  # X
             # Z X = iY. -i sin (iY) = sin Y
             # X -> X cos + Y sin
-            x_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['X'], self.qubits)
-            y_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Y'], self.qubits)
+            x_pauli = pauli_str.set_pauli_bit(1, self.qubits)
+            y_pauli = pauli_str.set_pauli_bit(2, self.qubits)
             return [
-                type(pauli_str)(x_paulis.paulis, x_paulis.coefficient * cos_val),
-                type(pauli_str)(y_paulis.paulis, y_paulis.coefficient * sin_val)
+                PauliString(x_pauli.bits, x_pauli.coefficient * cos_val, x_pauli.nqubits),
+                PauliString(y_pauli.bits, y_pauli.coefficient * sin_val, y_pauli.nqubits)
             ]
-        elif pauli_bits == PauliString._pauli_to_bit['Y']:
+        elif pauli_bits == 2:  # Y
             # Z Y = -iX. -i sin (-iX) = -sin X
             # Y -> Y cos - X sin
-            y_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['Y'], self.qubits)
-            x_paulis = pauli_str.set_pauli_bit(PauliString._pauli_to_bit['X'], self.qubits)
+            y_pauli = pauli_str.set_pauli_bit(2, self.qubits)
+            x_pauli = pauli_str.set_pauli_bit(1, self.qubits)
             return [
-                type(pauli_str)(y_paulis.paulis, y_paulis.coefficient * cos_val),
-                type(pauli_str)(x_paulis.paulis, x_paulis.coefficient * (-sin_val))
+                PauliString(y_pauli.bits, y_pauli.coefficient * cos_val, y_pauli.nqubits),
+                PauliString(x_pauli.bits, x_pauli.coefficient * (-sin_val), x_pauli.nqubits)
             ]
         return [pauli_str]
 
@@ -449,42 +529,56 @@ class RXX(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float32)
+        
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RXX':
+        if isinstance(self.theta, Parameter):
+            return RXX(self.qubits[0], self.qubits[1], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+
         q0, q1 = self.qubits
-        p0 = pauli_str.paulis.get(q0, 'I')
-        p1 = pauli_str.paulis.get(q1, 'I')
-        
+        # Get Pauli bits for the two qubits
+        pauli_bits = pauli_str.get_pauli_bit((q0, q1))
+        p0_bit = pauli_bits & 3       # Qubit q0
+        p1_bit = (pauli_bits >> 2) & 3  # Qubit q1
+
         # Check commutation with XX
-        # Anti-commutes if odd number of anti-commuting factors
-        # X anti-commutes with Y, Z.
+        # X (bit=1) anti-commutes with Y (bit=2), Z (bit=3)
         anti_count = 0
-        if p0 in ('Y', 'Z'): anti_count += 1
-        if p1 in ('Y', 'Z'): anti_count += 1
-        
+        if p0_bit in (2, 3): anti_count += 1  # Y or Z
+        if p1_bit in (2, 3): anti_count += 1  # Y or Z
+
         if anti_count % 2 == 0:
             # Commutes
             return [pauli_str]
-        
+
         # Anti-commutes: P -> P cos - i sin (XX P)
         cos_val = jnp.cos(self.theta)
         sin_val = jnp.sin(self.theta)
-        
-        term1 = type(pauli_str)(pauli_str.paulis, pauli_str.coefficient * cos_val)
-        
-        # Calculate XX * P
-        # Create XX PauliString
-        xx_pauli = PauliString({q0: 'X', q1: 'X'}, 1.0)
+
+        # term1: P cos(theta)
+        term1 = PauliString(pauli_str.bits, pauli_str.coefficient * cos_val, pauli_str.nqubits)
+
+        # Calculate XX * P using bit multiplication
+        # Create XX as bit encoding
+        xx_bits = (1 << (2 * q0)) | (1 << (2 * q1))  # X on both qubits
+        xx_pauli = PauliString(xx_bits, 1.0, pauli_str.nqubits)
         prod = xx_pauli * pauli_str
-        
-        # Result is P cos - i sin (prod)
-        # prod has some coefficient (phase).
-        # We want -i * sin * prod.coefficient
+
+        # term2: -i sin(theta) * (XX * P)
         new_coeff = -1j * sin_val * prod.coefficient
-        
-        term2 = type(pauli_str)(prod.paulis, new_coeff)
-        
+        term2 = PauliString(prod.bits, new_coeff, prod.nqubits)
+
         return [term1, term2]
 
 
@@ -493,33 +587,53 @@ class RYY(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float32)
+        
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RYY':
+        if isinstance(self.theta, Parameter):
+            return RYY(self.qubits[0], self.qubits[1], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+
         q0, q1 = self.qubits
-        p0 = pauli_str.paulis.get(q0, 'I')
-        p1 = pauli_str.paulis.get(q1, 'I')
-        
+        # Get Pauli bits for the two qubits
+        pauli_bits = pauli_str.get_pauli_bit((q0, q1))
+        p0_bit = pauli_bits & 3       # Qubit q0
+        p1_bit = (pauli_bits >> 2) & 3  # Qubit q1
+
         # Check commutation with YY
-        # Y anti-commutes with X, Z
+        # Y (bit=2) anti-commutes with X (bit=1), Z (bit=3)
         anti_count = 0
-        if p0 in ('X', 'Z'): anti_count += 1
-        if p1 in ('X', 'Z'): anti_count += 1
-        
+        if p0_bit in (1, 3): anti_count += 1  # X or Z
+        if p1_bit in (1, 3): anti_count += 1  # X or Z
+
         if anti_count % 2 == 0:
             return [pauli_str]
-            
+
         cos_val = jnp.cos(self.theta)
         sin_val = jnp.sin(self.theta)
-        
-        term1 = type(pauli_str)(pauli_str.paulis, pauli_str.coefficient * cos_val)
-        
-        yy_pauli = PauliString({q0: 'Y', q1: 'Y'}, 1.0)
+
+        # term1: P cos(theta)
+        term1 = PauliString(pauli_str.bits, pauli_str.coefficient * cos_val, pauli_str.nqubits)
+
+        # Calculate YY * P using bit multiplication
+        # Create YY as bit encoding
+        yy_bits = (2 << (2 * q0)) | (2 << (2 * q1))  # Y on both qubits
+        yy_pauli = PauliString(yy_bits, 1.0, pauli_str.nqubits)
         prod = yy_pauli * pauli_str
         new_coeff = -1j * sin_val * prod.coefficient
-        
-        term2 = type(pauli_str)(prod.paulis, new_coeff)
-        
+
+        term2 = PauliString(prod.bits, new_coeff, prod.nqubits)
+
         return [term1, term2]
 
 
@@ -528,33 +642,53 @@ class RZZ(Gate):
 
     def __init__(self, qubit1: int, qubit2: int, theta: Any):
         super().__init__((qubit1, qubit2))
-        self.theta = jnp.asarray(theta, dtype=jnp.float32)
+        
+        if isinstance(theta, str):
+            theta = Parameter(theta)
+            
+        self.theta = theta
+        if isinstance(theta, Parameter):
+            self.params = [theta]
+
+    def bind_parameters(self, param_values: list) -> 'RZZ':
+        if isinstance(self.theta, Parameter):
+            return RZZ(self.qubits[0], self.qubits[1], param_values[0])
+        return self
 
     def pauli_action(self, pauli_str) -> List:
+        if isinstance(self.theta, Parameter):
+            raise ValueError(f"Cannot apply gate with unbound parameter: {self.theta}")
+
         q0, q1 = self.qubits
-        p0 = pauli_str.paulis.get(q0, 'I')
-        p1 = pauli_str.paulis.get(q1, 'I')
-        
+        # Get Pauli bits for the two qubits
+        pauli_bits = pauli_str.get_pauli_bit((q0, q1))
+        p0_bit = pauli_bits & 3       # Qubit q0
+        p1_bit = (pauli_bits >> 2) & 3  # Qubit q1
+
         # Check commutation with ZZ
-        # Z anti-commutes with X, Y
+        # Z (bit=3) anti-commutes with X (bit=1), Y (bit=2)
         anti_count = 0
-        if p0 in ('X', 'Y'): anti_count += 1
-        if p1 in ('X', 'Y'): anti_count += 1
-        
+        if p0_bit in (1, 2): anti_count += 1  # X or Y
+        if p1_bit in (1, 2): anti_count += 1  # X or Y
+
         if anti_count % 2 == 0:
             return [pauli_str]
-            
+
         cos_val = jnp.cos(self.theta)
         sin_val = jnp.sin(self.theta)
-        
-        term1 = type(pauli_str)(pauli_str.paulis, pauli_str.coefficient * cos_val)
-        
-        zz_pauli = PauliString({q0: 'Z', q1: 'Z'}, 1.0)
+
+        # term1: P cos(theta)
+        term1 = PauliString(pauli_str.bits, pauli_str.coefficient * cos_val, pauli_str.nqubits)
+
+        # Calculate ZZ * P using bit multiplication
+        # Create ZZ as bit encoding
+        zz_bits = (3 << (2 * q0)) | (3 << (2 * q1))  # Z on both qubits
+        zz_pauli = PauliString(zz_bits, 1.0, pauli_str.nqubits)
         prod = zz_pauli * pauli_str
         new_coeff = -1j * sin_val * prod.coefficient
-        
-        term2 = type(pauli_str)(prod.paulis, new_coeff)
-        
+
+        term2 = PauliString(prod.bits, new_coeff, prod.nqubits)
+
         return [term1, term2]
 
 
